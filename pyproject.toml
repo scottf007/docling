@@ -311,6 +311,13 @@ docling = { workspace = true }
 package = true
 default-groups = "all"
 
+[tool.hatch.metadata]
+# Allow direct-reference (git+) dependencies for the docling-core /
+# docling-ibm-models pins above. Hatch refuses these by default; only
+# enabled on this internal-use integration branch (the upstream PR
+# branch keeps the standard PyPI version ranges).
+allow-direct-references = true
+
 [tool.hatch.build.targets.wheel]
 packages = ["docling"]
 
