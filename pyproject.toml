@@ -48,7 +48,7 @@ requires-python = '>=3.10,<4.0'
 # MINIMAL BASE (8 packages) - ~50MB
 dependencies = [
   'pydantic>=2.0.0,<3.0.0',
-  'docling-core @ git+https://github.com/scottf007/docling-core@integration/finance-nexus-pin',
+  'docling-core @ git+https://github.com/scottf007/docling-core@fn-pin-update-20260602',
   'pydantic-settings>=2.3.0,<3.0.0',
   'filetype>=1.2.0,<2.0.0',
   'requests>=2.32.2,<3.0.0',
@@ -190,7 +190,7 @@ feat-ocr-mac = [
 models-local = [
   'torch>=2.2.2,<3.0.0',
   'torchvision>=0,<1',
-  'docling-ibm-models @ git+https://github.com/scottf007/docling-ibm-models@fix/orphan-pdf-cell-silent-drop',
+  'docling-ibm-models @ git+https://github.com/scottf007/docling-ibm-models@fn-pin-update-20260602',
   'accelerate>=1.0.0,<2',
   'huggingface_hub>=0.23,<2',
   'defusedxml>=0.7.1,<0.8.0',
@@ -219,7 +219,7 @@ models-vlm-inline = [
 # ============================================================================
 # Document chunking for RAG applications
 feat-chunking = [
-  'docling-core[chunking] @ git+https://github.com/scottf007/docling-core@integration/finance-nexus-pin',
+  'docling-core[chunking] @ git+https://github.com/scottf007/docling-core@fn-pin-update-20260602',
 ]
 
 service-client = [
