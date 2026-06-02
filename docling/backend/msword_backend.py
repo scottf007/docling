@@ -378,15 +378,25 @@ class MsWordDocumentBackend(DeclarativeDocumentBackend):
 
                 if self.docx_to_pdf_converter is None:
                     if self.display_drawingml_warning:
-                        if self.docx_to_pdf_converter is None:
-                            _log.warning(
-                                "Found DrawingML elements in document, but no DOCX to PDF converters. "
-                                "If you want these exported, make sure you have "
-                                "LibreOffice binary in PATH or specify its path with DOCLING_LIBREOFFICE_CMD."
-                            )
-                            self.display_drawingml_warning = False
+                        _log.warning(
+                            "Found DrawingML elements in document, but no DOCX to PDF converters. "
+                            "If you want these exported, make sure you have "
+                            "LibreOffice binary in PATH or specify its path with DOCLING_LIBREOFFICE_CMD."
+                        )
+                        self.display_drawingml_warning = False
                 else:
                     self._handle_drawingml(doc=doc, drawingml_els=drawingml_els)
+
+                # Always process text in paragraph
+                if (
+                    tag_name == "p"
+                    and element.find(
+                        ".//w:t", namespaces=MsWordDocumentBackend._BLIP_NAMESPACES
+                    )
+                    is not None
+                ):
+                    te = self._handle_text_elements(element, doc, skip_empty_text=True)
+                    added_elements.extend(te)
             # Check for the sdt containers, like table of contents
             elif tag_name == "sdt":
                 sdt_content = element.find(
@@ -527,7 +537,38 @@ class MsWordDocumentBackend(DeclarativeDocumentBackend):
             self.list_counters[key] = 0
 
     def _build_enum_marker(self, numid: int, ilvl: int) -> str:
-        """Build full hierarchical marker like '1.2.3.'"""
+        """Build enumeration marker from the lvlText template (e.g. 'Proposal %1:').
+
+        Uses lvlText when it contains a text prefix/suffix beyond simple
+        placeholders and separators.  Falls back to the default '1.2.3.'
+        pattern for plain numeric markers.
+        """
+        lvl_element = self._get_level_element(numid, ilvl)
+        namespaces = {"w": self._W_NS}
+        lvl_text = None
+        if lvl_element is not None:
+            lt = lvl_element.find(".//w:lvlText", namespaces=namespaces)
+            if lt is not None:
+                lvl_text = lt.get(self.XML_KEY)
+
+        # Use lvlText as template only when it contains %N placeholders
+        # alongside non-trivial text (e.g. "Proposal %1:", "Table %1").
+        # Skip when lvlText is a bare bullet symbol like "o" or "•".
+        if lvl_text and re.search(r"%\d+", lvl_text):
+            stripped = re.sub(r"%\d+", "", lvl_text)
+            stripped = stripped.strip(" .)(:[]")
+            if stripped:
+
+                def _replace(match):
+                    lvl_idx = int(match.group(1)) - 1
+                    counter = self.list_counters.get((numid, lvl_idx))
+                    if counter is None:
+                        counter = self._get_start_value(numid, lvl_idx)
+                    return str(counter)
+
+                return re.sub(r"%(\d+)", _replace, lvl_text)
+
+        # Fallback: default hierarchical '1.2.3.' pattern
         parts = []
         for lvl in range(ilvl + 1):
             counter = self.list_counters.get((numid, lvl))
@@ -1147,20 +1188,24 @@ class MsWordDocumentBackend(DeclarativeDocumentBackend):
 
         # Insert equations into original text
         # This is done to preserve white space structure
-        output_text = text[:]
-        init_i = 0
-        for i_substr, substr in enumerate(texts_and_equations):
+        output_text = ""
+        text_pos = 0
+
+        for substr in texts_and_equations:
             if len(substr) == 0:
                 continue
-
-            if substr in output_text[init_i:]:
-                init_i += output_text[init_i:].find(substr) + len(substr)
+            if substr.startswith("<eq>"):
+                # This is an equation - insert it directly
+                output_text += substr
             else:
-                if i_substr > 0:
-                    output_text = output_text[:init_i] + substr + output_text[init_i:]
-                    init_i += len(substr)
+                # This is a text fragment - find it in original text
+                pos = text.find(substr, text_pos)
+                if pos >= 0:
+                    output_text += substr
+                    text_pos = pos + len(substr)
                 else:
-                    output_text = substr + output_text
+                    # Fallback: if not found, just append it
+                    output_text += substr
 
         return output_text, only_equations
 
@@ -1181,6 +1226,7 @@ class MsWordDocumentBackend(DeclarativeDocumentBackend):
         self,
         element: BaseOxmlElement,
         doc: DoclingDocument,
+        skip_empty_text: bool = False,
     ) -> list[RefItem]:
         elem_ref: list[RefItem] = []
         paragraph = Paragraph(element, self.docx_obj)
@@ -1333,6 +1379,11 @@ class MsWordDocumentBackend(DeclarativeDocumentBackend):
                 clean_text = (
                     self._clean_checkbox_symbols(text) if checkbox_label else text
                 )
+
+                # Skip empty text items
+                if skip_empty_text and (not clean_text or not clean_text.strip()):
+                    continue
+
                 text_item = doc.add_text(
                     label=checkbox_label if checkbox_label else DocItemLabel.TEXT,
                     parent=parent,

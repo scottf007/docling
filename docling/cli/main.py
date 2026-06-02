@@ -39,11 +39,19 @@ from docling_core.utils.file import resolve_source_to_path
 from pydantic import TypeAdapter
 from rich.console import Console
 
-from docling.backend.docling_parse_backend import DoclingParseDocumentBackend
+from docling.backend.docling_parse_backend import (
+    DoclingParseDocumentBackend,
+    ThreadedDoclingParseDocumentBackend,
+)
 from docling.backend.image_backend import ImageDocumentBackend
 from docling.backend.mets_gbs_backend import MetsGbsDocumentBackend
 from docling.backend.pdf_backend import PdfDocumentBackend
 from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
+from docling.cli.export_utils import (
+    _is_empty_output,
+    _should_generate_export_images,
+    _split_list,
+)
 from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions
 from docling.datamodel.asr_model_specs import (
     WHISPER_BASE,
@@ -66,9 +74,15 @@ from docling.datamodel.asr_model_specs import (
     WHISPER_TURBO_NATIVE,
     AsrModelType,
 )
-from docling.datamodel.backend_options import PdfBackendOptions
+from docling.datamodel.backend_options import (
+    LatexBackendOptions,
+    PdfBackendOptions,
+    ThreadedDoclingParseBackendOptions,
+)
 from docling.datamodel.base_models import (
     ConversionStatus,
+    DoclingComponentType,
+    ErrorItem,
     FormatToExtensions,
     InputFormat,
     OutputFormat,
@@ -183,7 +197,12 @@ def logo_callback(value: bool):
 def version_callback(value: bool):
     if value:
         v = DoclingVersion()
-        print(f"Docling version: {v.docling_version}")
+        docling_version = (
+            v.docling_version
+            if v.docling_version != "unknown"
+            else v.docling_slim_version
+        )
+        print(f"Docling version: {docling_version}")
         print(f"Docling Core version: {v.docling_core_version}")
         print(f"Docling IBM Models version: {v.docling_ibm_models_version}")
         print(f"Docling Parse version: {v.docling_parse_version}")
@@ -239,8 +258,8 @@ def export_documents(
     failure_count = 0
 
     for conv_res in conv_results:
-        if conv_res.status == ConversionStatus.SUCCESS:
-            success_count += 1
+        doc_failed = conv_res.status != ConversionStatus.SUCCESS
+        if not doc_failed:
             doc_filename = conv_res.input.file.stem
 
             # Export JSON format:
@@ -310,6 +329,21 @@ def export_documents(
                 conv_res.document.save_as_markdown(
                     filename=fname, image_mode=image_export_mode
                 )
+                if _is_empty_output(fname):
+                    error_message = (
+                        "Markdown export produced empty output for "
+                        f"{conv_res.input.file.name}"
+                    )
+                    _log.error(error_message)
+                    conv_res.errors.append(
+                        ErrorItem(
+                            component_type=DoclingComponentType.DOC_ASSEMBLER,
+                            module_name="export_documents",
+                            error_message=error_message,
+                        )
+                    )
+                    conv_res.status = ConversionStatus.FAILURE
+                    doc_failed = True
 
             # Export Document Tags format:
             if export_doctags:
@@ -367,7 +401,7 @@ def export_documents(
                     r = TimingsT.dump_json(conv_res.timings, indent=2)
                     fp.write(r)
 
-        else:
+        if doc_failed:
             _log.warning(f"Document {conv_res.input.file} failed to convert.")
             if _log.isEnabledFor(logging.INFO):
                 for err in conv_res.errors:
@@ -376,40 +410,17 @@ def export_documents(
                         f"Module: {err.module_name}, Message: {err.error_message}"
                     )
             failure_count += 1
+        else:
+            success_count += 1
 
     _log.info(
         f"Processed {success_count + failure_count} docs, of which {failure_count} failed"
     )
 
 
-def _split_list(raw: str | None) -> list[str] | None:
-    if raw is None:
-        return None
-    return re.split(r"[;,]", raw)
-
-
-_OUTPUT_FORMATS_NOT_SUPPORTING_IMAGE_EMBEDDING = frozenset(
-    {
-        OutputFormat.TEXT,
-        OutputFormat.DOCTAGS,
-        OutputFormat.VTT,
-    }
-)
-
-
-def _should_generate_export_images(
-    image_export_mode: ImageRefMode,
-    to_formats: list[OutputFormat],
-) -> bool:
-    return image_export_mode != ImageRefMode.PLACEHOLDER and any(
-        to_format not in _OUTPUT_FORMATS_NOT_SUPPORTING_IMAGE_EMBEDDING
-        for to_format in to_formats
-    )
-
-
 @app.command(no_args_is_help=True)
 def convert(  # noqa: C901
-    input_sources: Annotated[
+    source: Annotated[
         list[str],
         typer.Argument(
             ...,
@@ -420,7 +431,7 @@ def convert(  # noqa: C901
     from_formats: list[InputFormat] = typer.Option(
         None,
         "--from",
-        help="Specify input formats to convert from. Defaults to all formats.",
+        help="Input formats to accept. Defaults to all supported formats.",
     ),
     to_formats: list[OutputFormat] = typer.Option(
         None, "--to", help="Specify output formats. Defaults to Markdown."
@@ -595,7 +606,7 @@ def convert(  # noqa: C901
     debug_visualize_layout: Annotated[
         bool,
         typer.Option(
-            ..., help="Enable debug output which visualizes the layour clusters"
+            ..., help="Enable debug output which visualizes the layout clusters"
         ),
     ] = False,
     debug_visualize_tables: Annotated[
@@ -619,6 +630,16 @@ def convert(  # noqa: C901
         ),
     ] = None,
     num_threads: Annotated[int, typer.Option(..., help="Number of threads")] = 4,
+    release_native_memory_every_n_pages: Annotated[
+        int,
+        typer.Option(
+            ...,
+            help=(
+                "Release native parser memory after every N decoded pages when "
+                "using the threaded docling-parse backend."
+            ),
+        ),
+    ] = 128,
     device: Annotated[
         AcceleratorDevice, typer.Option(..., help="Accelerator device")
     ] = AcceleratorDevice.AUTO,
@@ -678,13 +699,13 @@ def convert(  # noqa: C901
 
     with tempfile.TemporaryDirectory() as tempdir:
         input_doc_paths: list[Path] = []
-        for src in input_sources:
+        for src in source:
             try:
                 # check if we can fetch some remote url
-                source = resolve_source_to_path(
+                resolved_source = resolve_source_to_path(
                     source=src, headers=parsed_headers, workdir=Path(tempdir)
                 )
-                input_doc_paths.append(source)
+                input_doc_paths.append(resolved_source)
             except FileNotFoundError:
                 err_console.print(
                     f"[red]Error: The input file {src} does not exist.[/red]"
@@ -695,6 +716,8 @@ def convert(  # noqa: C901
                 try:
                     local_path = TypeAdapter(Path).validate_python(src)
                     if local_path.exists() and local_path.is_dir():
+                        # Use a set to track unique paths and avoid duplicates
+                        seen_paths: set[Path] = set()
                         for fmt in from_formats:
                             for ext in FormatToExtensions[fmt]:
                                 for path in local_path.glob(f"**/*.{ext}"):
@@ -703,7 +726,9 @@ def convert(  # noqa: C901
                                             f"Ignoring temporary Word file: {path}"
                                         )
                                         continue
-                                    input_doc_paths.append(path)
+                                    if path not in seen_paths:
+                                        seen_paths.add(path)
+                                        input_doc_paths.append(path)
 
                                 for path in local_path.glob(f"**/*.{ext.upper()}"):
                                     if path.name.startswith("~$") and ext == "docx":
@@ -711,7 +736,9 @@ def convert(  # noqa: C901
                                             f"Ignoring temporary Word file: {path}"
                                         )
                                         continue
-                                    input_doc_paths.append(path)
+                                    if path not in seen_paths:
+                                        seen_paths.add(path)
+                                        input_doc_paths.append(path)
                     elif local_path.exists():
                         if not local_path.name.startswith("~$") and ext == "docx":
                             _log.info(f"Ignoring temporary Word file: {path}")
@@ -752,12 +779,8 @@ def convert(  # noqa: C901
             ocr_options, TesseractOcrOptions | TesseractCliOcrOptions
         ):
             ocr_options.psm = psm
-
         accelerator_options = AcceleratorOptions(num_threads=num_threads, device=device)
-
-        # pipeline_options: PaginatedPipelineOptions
         pipeline_options: PipelineOptions
-
         format_options: dict[InputFormat, FormatOption] = {}
         pdf_backend_options: PdfBackendOptions | None = PdfBackendOptions(
             password=pdf_password
@@ -781,9 +804,7 @@ def convert(  # noqa: C901
             if isinstance(
                 pipeline_options.table_structure_options, TableStructureOptions
             ):
-                pipeline_options.table_structure_options.do_cell_matching = (
-                    True  # do_cell_matching
-                )
+                pipeline_options.table_structure_options.do_cell_matching = True
                 pipeline_options.table_structure_options.mode = table_mode
 
             if _should_generate_export_images(
@@ -795,13 +816,19 @@ def convert(  # noqa: C901
                     True  # FIXME: to be deprecated in version 3
                 )
                 pipeline_options.images_scale = 2
-
-            # Normalize deprecated backend values
             pdf_backend = normalize_pdf_backend(pdf_backend)
-
             backend: Type[PdfDocumentBackend]
             if pdf_backend == PdfBackend.DOCLING_PARSE:
                 backend = DoclingParseDocumentBackend  # type: ignore
+            elif pdf_backend == PdfBackend.THREADED_DOCLING_PARSE:
+                backend = ThreadedDoclingParseDocumentBackend  # type: ignore
+                pdf_backend_options = ThreadedDoclingParseBackendOptions(
+                    password=pdf_password,
+                    parser_threads=num_threads,
+                    release_native_memory_every_n_pages=(
+                        release_native_memory_every_n_pages
+                    ),
+                )
             elif pdf_backend == PdfBackend.PYPDFIUM2:
                 backend = PyPdfiumDocumentBackend  # type: ignore
             else:
@@ -812,16 +839,12 @@ def convert(  # noqa: C901
                 backend=backend,  # pdf_backend
                 backend_options=pdf_backend_options,
             )
-
-            # METS GBS options
             mets_gbs_options = pipeline_options.model_copy()
             mets_gbs_options.do_ocr = False
             mets_gbs_format_option = PdfFormatOption(
                 pipeline_options=mets_gbs_options,
                 backend=MetsGbsDocumentBackend,
             )
-
-            # SimplePipeline options
             simple_format_option = ConvertPipelineOptions(
                 do_picture_description=enrich_picture_description,
                 do_picture_classification=enrich_picture_classes,
@@ -829,8 +852,6 @@ def convert(  # noqa: C901
             )
             if artifacts_path is not None:
                 simple_format_option.artifacts_path = artifacts_path
-
-            # Use image-native backend for IMAGE to avoid pypdfium2 locking
             image_format_option = PdfFormatOption(
                 pipeline_options=pipeline_options,
                 backend=ImageDocumentBackend,
@@ -857,7 +878,8 @@ def convert(  # noqa: C901
                     pipeline_options=simple_format_option
                 ),
                 InputFormat.LATEX: LatexFormatOption(
-                    pipeline_options=simple_format_option
+                    pipeline_options=simple_format_option,
+                    backend_options=LatexBackendOptions(),
                 ),
             }
 

@@ -1,11 +1,16 @@
 from pathlib import Path
+from typing import Any
 
 import pytest
 from docling_core.types.doc import ImageRefMode
 from typer.testing import CliRunner
 
-from docling.cli.main import _should_generate_export_images, app
-from docling.datamodel.base_models import OutputFormat
+from docling.cli.export_utils import _should_generate_export_images, _split_list
+from docling.cli.main import app
+from docling.datamodel.backend_options import ThreadedDoclingParseBackendOptions
+from docling.datamodel.base_models import InputFormat, OutputFormat
+from docling.datamodel.pipeline_options import PdfBackend
+from docling.document_converter import PdfFormatOption
 
 runner = CliRunner()
 
@@ -13,6 +18,11 @@ runner = CliRunner()
 def test_cli_help():
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
+    assert "Input formats to" in result.output
+    assert "all supported" in result.output
+    assert "layout clusters" in result.output
+    assert "layour" not in result.output
+    assert "input_sources" not in result.output
 
 
 def test_cli_version():
@@ -28,6 +38,117 @@ def test_cli_convert(tmp_path):
     assert result.exit_code == 0
     converted = output / f"{Path(source).stem}.md"
     assert converted.exists()
+
+
+def test_export_documents_marks_empty_markdown_as_failure(tmp_path):
+    from docling.cli.main import export_documents
+    from docling.datamodel.base_models import ConversionStatus, InputFormat
+    from docling.datamodel.document import (
+        ConversionResult,
+        InputDocument,
+        _DummyBackend,
+    )
+
+    input_path = tmp_path / "input.pdf"
+    input_path.write_bytes(b"%PDF-1.4")
+
+    input_doc = InputDocument(
+        path_or_stream=input_path,
+        format=InputFormat.PDF,
+        backend=_DummyBackend,
+    )
+
+    conv_res = ConversionResult(input=input_doc)
+    conv_res.status = ConversionStatus.SUCCESS
+
+    class DummyDocument:
+        def save_as_markdown(self, *, filename, image_mode):
+            Path(filename).write_text("")
+
+    conv_res.document = DummyDocument()
+
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+
+    export_documents(
+        [conv_res],
+        output_dir=output_dir,
+        export_json=False,
+        export_yaml=False,
+        export_html=False,
+        export_html_split_page=False,
+        show_layout=False,
+        export_md=True,
+        export_txt=False,
+        export_doctags=False,
+        export_vtt=False,
+        print_timings=False,
+        export_timings=False,
+        image_export_mode=ImageRefMode.PLACEHOLDER,
+    )
+
+    assert conv_res.status == ConversionStatus.FAILURE
+    assert conv_res.errors
+
+
+def test_export_documents_marks_stat_errors_as_failure(tmp_path, monkeypatch):
+    from docling.cli.main import export_documents
+    from docling.datamodel.base_models import ConversionStatus, InputFormat
+    from docling.datamodel.document import (
+        ConversionResult,
+        InputDocument,
+        _DummyBackend,
+    )
+
+    input_path = tmp_path / "input.pdf"
+    input_path.write_bytes(b"%PDF-1.4")
+
+    input_doc = InputDocument(
+        path_or_stream=input_path,
+        format=InputFormat.PDF,
+        backend=_DummyBackend,
+    )
+
+    conv_res = ConversionResult(input=input_doc)
+    conv_res.status = ConversionStatus.SUCCESS
+
+    class DummyDocument:
+        def save_as_markdown(self, *, filename, image_mode):
+            Path(filename).write_text("ok")
+
+    conv_res.document = DummyDocument()
+
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+
+    original_stat = Path.stat
+
+    def _raise_for_markdown(self, *, follow_symlinks=True):
+        if self.name == "input.md":
+            raise OSError("stat failed")
+        return original_stat(self, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, "stat", _raise_for_markdown)
+
+    export_documents(
+        [conv_res],
+        output_dir=output_dir,
+        export_json=False,
+        export_yaml=False,
+        export_html=False,
+        export_html_split_page=False,
+        show_layout=False,
+        export_md=True,
+        export_txt=False,
+        export_doctags=False,
+        export_vtt=False,
+        print_timings=False,
+        export_timings=False,
+        image_export_mode=ImageRefMode.PLACEHOLDER,
+    )
+
+    assert conv_res.status == ConversionStatus.FAILURE
+    assert conv_res.errors
 
 
 @pytest.mark.parametrize(
@@ -57,6 +178,11 @@ def test_image_export_policy_covers_all_output_formats():
 
     assert image_export_formats.isdisjoint(non_image_export_formats)
     assert image_export_formats | non_image_export_formats == set(OutputFormat)
+
+
+def test_split_list_handles_none_and_delimiters():
+    assert _split_list(None) is None
+    assert _split_list("a,b;c") == ["a", "b", "c"]
 
 
 def test_cli_audio_auto_detection(tmp_path):
@@ -122,3 +248,63 @@ def test_cli_audio_extensions_coverage():
         assert ext in audio_extensions, (
             f"Audio extension {ext} not found in FormatToExtensions[InputFormat.AUDIO]"
         )
+
+
+def test_cli_accepts_threaded_docling_parse_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured_backend: type[Any] | None = None
+    captured_backend_options: ThreadedDoclingParseBackendOptions | None = None
+
+    class _FakeDocumentConverter:
+        def __init__(
+            self,
+            *,
+            allowed_formats: list[InputFormat],
+            format_options: dict[InputFormat, PdfFormatOption],
+        ) -> None:
+            nonlocal captured_backend
+            nonlocal captured_backend_options
+            pdf_option = format_options[InputFormat.PDF]
+            assert isinstance(pdf_option, PdfFormatOption)
+            captured_backend = pdf_option.backend
+            assert isinstance(
+                pdf_option.backend_options, ThreadedDoclingParseBackendOptions
+            )
+            captured_backend_options = pdf_option.backend_options
+
+        def convert_all(
+            self,
+            input_doc_paths: list[Path],
+            headers: dict[str, str] | None = None,
+            raises_on_error: bool = False,
+        ) -> list[Any]:
+            assert len(input_doc_paths) == 1
+            return []
+
+    monkeypatch.setattr("docling.cli.main.DocumentConverter", _FakeDocumentConverter)
+
+    source = "./tests/data/pdf/2305.03393v1-pg9.pdf"
+    output = tmp_path / "out"
+
+    result = runner.invoke(
+        app,
+        [
+            source,
+            "--output",
+            str(output),
+            "--pdf-backend",
+            PdfBackend.THREADED_DOCLING_PARSE.value,
+            "--num-threads",
+            "7",
+            "--release-native-memory-every-n-pages",
+            "64",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured_backend is not None
+    assert captured_backend.__name__ == "ThreadedDoclingParseDocumentBackend"
+    assert captured_backend_options is not None
+    assert captured_backend_options.parser_threads == 7
+    assert captured_backend_options.release_native_memory_every_n_pages == 64

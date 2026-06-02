@@ -46,7 +46,7 @@ def test_convert_valid():
         assert backend.is_valid()
 
         act_doc = backend.convert()
-        act_data = act_doc.export_to_markdown()
+        act_data = act_doc.export_to_markdown(compact_tables=True)
 
         if in_path.stem in json_filter:
             assert verify_document(act_doc, json_gt_path, GEN_TEST_DATA), (
@@ -102,7 +102,7 @@ def test_e2e_md_conversions():
 
         doc: DoclingDocument = conv_result.document
 
-        pred_md: str = doc.export_to_markdown()
+        pred_md: str = doc.export_to_markdown(compact_tables=True)
         assert true_md == pred_md
 
         conv_result_: ConversionResult = converter.convert_string(
@@ -111,7 +111,7 @@ def test_e2e_md_conversions():
 
         doc_: DoclingDocument = conv_result_.document
 
-        pred_md_: str = doc_.export_to_markdown()
+        pred_md_: str = doc_.export_to_markdown(compact_tables=True)
         assert true_md == pred_md_
 
 
@@ -137,3 +137,27 @@ Here is some content...
         "- This is an open access article under the terms of the Creative Commons Attribution License"
         in pred_md
     )
+
+
+def test_convert_list_item_codespan_only():
+    """
+    Regression test:
+    A list item that only contains an inline CodeSpan (no RawText) must not leave
+    a pending ListItem payload behind, otherwise later RawText will attach it to a
+    wrong parent and create a very deep tree (RecursionError in iterate/export).
+    """
+    converter = get_converter()
+    markdown = """# Title
+
+*   `raw_ops.Abort`
+*   `raw_ops.Abs`
+"""
+
+    conv_result: ConversionResult = converter.convert_string(
+        markdown, format=InputFormat.MD
+    )
+    assert conv_result.status == ConversionStatus.SUCCESS
+
+    pred_md = conv_result.document.export_to_markdown()
+    assert "- raw\\_ops.Abort" in pred_md
+    assert "- raw\\_ops.Abs" in pred_md

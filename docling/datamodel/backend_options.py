@@ -1,7 +1,7 @@
 from pathlib import Path, PurePath
 from typing import Annotated, Literal, Optional, Union
 
-from pydantic import AnyUrl, BaseModel, Field, PositiveInt, SecretStr
+from pydantic import AnyUrl, BaseModel, Field, PositiveInt, SecretStr, conint
 
 
 class BaseBackendOptions(BaseModel):
@@ -84,6 +84,18 @@ class HTMLBackendOptions(BaseBackendOptions):
             "will use it to resolve relative paths in the HTML document."
         ),
     )
+    headers: Annotated[
+        dict[str, str] | None,
+        Field(
+            description=(
+                "HTTP headers to include when fetching remote images. Use for "
+                "authentication (e.g., API keys, bearer tokens) or custom headers "
+                "required by image servers."
+            ),
+            examples=[{"Authorization": "Bearer TOKEN"}, {"X-API-Key": "your-api-key"}],
+            repr=False,
+        ),
+    ] = None
     add_title: bool = Field(
         True, description="Add the HTML title tag as furniture in the DoclingDocument."
     )
@@ -97,6 +109,10 @@ class HTMLBackendOptions(BaseBackendOptions):
     max_remote_image_bytes: PositiveInt = Field(
         20 * 1024 * 1024,  # 20 MB
         description="The maximum number of bytes for remote image downloads.",
+    )
+    max_redirects: Annotated[int, Field(ge=0)] = Field(
+        5,
+        description="Maximum number of HTTP redirects to follow when fetching remote resources. Set to 0 to disable redirects.",
     )
 
 
@@ -125,6 +141,29 @@ class PdfBackendOptions(BaseBackendOptions):
 
     kind: Literal["pdf"] = Field("pdf", exclude=True, repr=False)
     password: Optional[SecretStr] = None
+
+
+class ThreadedDoclingParseBackendOptions(PdfBackendOptions):
+    """Options specific to the threaded docling-parse backend."""
+
+    kind: Literal["threaded-docling-parse"] = Field(
+        "threaded-docling-parse", exclude=True, repr=False
+    )
+    parser_threads: Optional[PositiveInt] = Field(
+        None,
+        description=(
+            "Number of parser threads to use for the threaded docling-parse backend. "
+            "If unset, the backend falls back to global accelerator thread settings."
+        ),
+    )
+    release_native_memory_every_n_pages: conint(ge=0) = Field(
+        128,
+        description=(
+            "Release native parser memory after every N decoded pages in the "
+            "threaded docling-parse backend. Set to 0 to disable native-memory "
+            "release."
+        ),
+    )
 
 
 class MetsGbsBackendOptions(PdfBackendOptions):
@@ -188,6 +227,25 @@ class LatexBackendOptions(BaseBackendOptions):
             "Set to None to disable the timeout. Defaults to 30 s."
         ),
     )
+    tikz_engine: Optional[Literal["tectonic"]] = Field(
+        None,
+        description=(
+            "The engine to use for rendering Tikz diagrams into images. "
+            "Set to 'tectonic' to enable asynchronous image generation."
+        ),
+    )
+    tikz_engine_timeout: float = Field(
+        60.0,
+        description="The timeout in seconds for rendering a single TikZ diagram.",
+    )
+    tikz_engine_allow_shell_escape: bool = Field(
+        False,
+        description=(
+            "Allow Tectonic TikZ rendering to enable shell escape during "
+            "compilation. Disabled by default for safer rendering of untrusted "
+            "LaTeX."
+        ),
+    )
 
 
 class XBRLBackendOptions(BaseBackendOptions):
@@ -215,6 +273,7 @@ BackendOptions = Annotated[
         HTMLBackendOptions,
         MarkdownBackendOptions,
         PdfBackendOptions,
+        ThreadedDoclingParseBackendOptions,
         MetsGbsBackendOptions,
         MsExcelBackendOptions,
         LatexBackendOptions,

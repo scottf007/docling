@@ -94,7 +94,7 @@ def _test_e2e_docx_conversions_impl(docx_paths: list[tuple[Path, DoclingDocument
             print(f"Skipping {docx_path} because no Libreoffice is installed.")
             continue
 
-        pred_md: str = doc.export_to_markdown()
+        pred_md: str = doc.export_to_markdown(compact_tables=True)
         assert verify_export(pred_md, str(docx_path) + ".md", generate=GENERATE), (
             f"export to markdown failed on {docx_path}"
         )
@@ -187,6 +187,33 @@ def test_text_after_image_anchors(documents):
         and found_text_after_anchor_2
         and found_text_after_anchor_3
         and found_text_after_anchor_4
+    )
+
+
+def test_text_with_drawingml_without_libreoffice(docx_paths, monkeypatch):
+    """Test that text is extracted from paragraphs with DrawingML images even without LibreOffice."""
+    monkeypatch.setattr(
+        msword_backend_module, "get_docx_to_pdf_converter", lambda: None
+    )
+
+    # Use word_image_anchors.docx which contains images with text
+    name = "word_image_anchors.docx"
+    path = next(item for item in docx_paths if item.name == name)
+
+    converter = get_converter()
+    conv_result = converter.convert(path)
+    doc = conv_result.document
+
+    text_items = [item for item, _ in doc.iterate_items() if isinstance(item, TextItem)]
+    assert len(text_items) > 0, (
+        "Expected text items to be extracted even without LibreOffice"
+    )
+
+    all_text = " ".join(item.text for item in text_items)
+    assert len(all_text) > 0, "Expected non-empty text content"
+
+    assert "This is test 1" in all_text or "This is test 2" in all_text, (
+        "Expected text from paragraphs with images to be extracted"
     )
 
 
@@ -531,6 +558,76 @@ def test_list_counter_and_enum_marker(docx_paths):
     assert backend.list_counters[(2, 0)] == 1  # unaffected
 
 
+def test_custom_numbering_format_markers(tmp_path):
+    """Test that lvlText templates like 'Proposal %1:' produce correct markers.
+
+    Word documents can define custom numbering formats in the lvlText element,
+    e.g. 'Proposal %1:' or 'Observation %1:'. The marker should preserve the
+    text prefix/suffix and substitute %N with the counter value for level N.
+    """
+    from docx import Document
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    doc = Document()
+
+    # Add numbering definitions with custom lvlText
+    numbering_part = doc.part.numbering_part
+    numbering = numbering_part.element
+
+    # Create abstractNum with lvlText="Proposal %1:" at level 0
+    abstract_num = OxmlElement("w:abstractNum")
+    abstract_num.set(qn("w:abstractNumId"), "100")
+    lvl = OxmlElement("w:lvl")
+    lvl.set(qn("w:ilvl"), "0")
+    start = OxmlElement("w:start")
+    start.set(qn("w:val"), "1")
+    lvl.append(start)
+    numfmt = OxmlElement("w:numFmt")
+    numfmt.set(qn("w:val"), "decimal")
+    lvl.append(numfmt)
+    lvltext = OxmlElement("w:lvlText")
+    lvltext.set(qn("w:val"), "Proposal %1:")
+    lvl.append(lvltext)
+    abstract_num.append(lvl)
+    numbering.append(abstract_num)
+
+    # Create num referencing abstractNum 100
+    num_elem = OxmlElement("w:num")
+    num_elem.set(qn("w:numId"), "200")
+    abstract_ref = OxmlElement("w:abstractNumId")
+    abstract_ref.set(qn("w:val"), "100")
+    num_elem.append(abstract_ref)
+    numbering.append(num_elem)
+
+    # Save and load through backend
+    docx_path = tmp_path / "custom_numbering.docx"
+    doc.save(str(docx_path))
+
+    in_doc = InputDocument(
+        path_or_stream=docx_path,
+        format=InputFormat.DOCX,
+        backend=MsWordDocumentBackend,
+    )
+    backend = in_doc._backend
+
+    # Simulate counter state and verify markers
+    backend.list_counters[(200, 0)] = 1
+    assert backend._build_enum_marker(200, 0) == "Proposal 1:"
+
+    backend.list_counters[(200, 0)] = 3
+    assert backend._build_enum_marker(200, 0) == "Proposal 3:"
+
+    # Verify plain numeric markers still work (no text prefix)
+    backend.list_counters[(1, 0)] = 5
+    assert backend._build_enum_marker(1, 0) == "5."
+
+    # Verify hierarchical markers still work
+    backend.list_counters[(1, 0)] = 2
+    backend.list_counters[(1, 1)] = 3
+    assert backend._build_enum_marker(1, 1) == "2.3."
+
+
 def test_handle_equations_in_text_returns_original_text_on_mismatch(
     backend, monkeypatch
 ):
@@ -721,3 +818,36 @@ def test_checkbox_labels_in_tables(documents):
     ]
 
     assert len(found_food_checkboxes) > 0, "No checkboxes found in table cells"
+
+
+def test_text_after_drawingml_images(documents):
+    """Text in paragraphs containing DrawingML images was being omitted during conversion, both with and without LibreOffice."""
+    name = "drawingml.docx"
+
+    doc_found = False
+    for path, doc in documents:
+        if path.name == name:
+            doc_found = True
+
+            text_items = [
+                item for item, _ in doc.iterate_items() if isinstance(item, TextItem)
+            ]
+
+            assert len(text_items) > 0, (
+                f"No text items found in {name}. "
+                "Text after DrawingML images should be preserved even without LibreOffice."
+            )
+
+            # Log the text items found for debugging
+            _log.info(f"Found {len(text_items)} text items in {name}")
+            for idx, item in enumerate(text_items[:5]):  # Log first 5 items
+                _log.info(f"  Text item {idx}: {item.text[:50]}...")
+
+            break
+
+    if not doc_found:
+        _log.warning(
+            f"Test document '{name}' not found in test set. "
+            "Skipping DrawingML text extraction test."
+        )
+        pytest.skip(f"Test document '{name}' not available")

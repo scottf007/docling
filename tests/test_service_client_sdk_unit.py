@@ -1,4 +1,7 @@
 import asyncio
+import queue
+import threading
+import time
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path, PurePath
@@ -19,7 +22,12 @@ from docling.datamodel.service.responses import (
     TaskStatusResponse,
     WebsocketMessage,
 )
-from docling.service_client import ConversionItem, DoclingServiceClient
+from docling.service_client import (
+    DEFAULT_MAX_CONCURRENCY,
+    MAX_CONCURRENCY_LIMIT,
+    ConversionItem,
+    DoclingServiceClient,
+)
 from docling.service_client.exceptions import (
     ConversionError,
     ResultExpiredError,
@@ -64,9 +72,21 @@ def _convert_payload(source_name: str) -> SimpleNamespace:
 def test_base_url_accepts_root_with_or_without_trailing_slash() -> None:
     with DoclingServiceClient(url=TEST_BASE_URL) as client:
         assert client._base_url == TEST_BASE_URL
+        assert client._max_concurrency == DEFAULT_MAX_CONCURRENCY
 
     with DoclingServiceClient(url=f"{TEST_BASE_URL}/") as client:
         assert client._base_url == TEST_BASE_URL
+
+
+@pytest.mark.parametrize("value", [0, -1, MAX_CONCURRENCY_LIMIT + 1])
+def test_client_rejects_invalid_default_max_concurrency(value: int) -> None:
+    with pytest.raises(
+        ValueError,
+        match=(
+            f"max_concurrency must be between 1 and {MAX_CONCURRENCY_LIMIT}, got {value}."
+        ),
+    ):
+        DoclingServiceClient(url=TEST_BASE_URL, max_concurrency=value)
 
 
 @pytest.mark.parametrize(
@@ -74,6 +94,8 @@ def test_base_url_accepts_root_with_or_without_trailing_slash() -> None:
     [
         f"{TEST_BASE_URL}/v1",
         f"{TEST_BASE_URL}/v1/",
+        "http://proxy.example.com/docling/v1",
+        "http://proxy.example.com/a/b/v1/",
     ],
 )
 def test_base_url_rejects_v1_path(url: str) -> None:
@@ -293,6 +315,142 @@ def test_websocket_watcher_treats_clean_close_on_next_as_end_of_stream(
     assert [update.task_status for update in updates] == ["pending", "pending"]
 
 
+def test_websocket_watcher_reconnects_after_connection_drop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeConnectionClosedError(Exception):
+        pass
+
+    class FakeConnectionClosedOK(Exception):
+        pass
+
+    connection_calls: list[int] = []
+
+    class FirstConnection:
+        def __init__(self) -> None:
+            self._consumed = False
+
+        def __enter__(self) -> "FirstConnection":
+            return self
+
+        def recv(self, timeout: float | None = None) -> str:
+            if self._consumed:
+                raise FakeConnectionClosedError("connection reset")
+            self._consumed = True
+            return WebsocketMessage(
+                message=MessageKind.CONNECTION,
+                task=_status_response("task-1", "pending"),
+            ).model_dump_json()
+
+        def send(self, message: str) -> None:
+            pass
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    class SecondConnection:
+        def __init__(self) -> None:
+            self._messages = iter(
+                [
+                    WebsocketMessage(
+                        message=MessageKind.CONNECTION,
+                        task=_status_response("task-1", "pending"),
+                    ).model_dump_json(),
+                    WebsocketMessage(
+                        message=MessageKind.UPDATE,
+                        task=_status_response("task-1", "success"),
+                    ).model_dump_json(),
+                ]
+            )
+
+        def recv(self, timeout: float | None = None) -> str:
+            return next(self._messages)
+
+        def send(self, message: str) -> None:
+            pass
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def __enter__(self) -> "SecondConnection":
+            return self
+
+    connections = iter([FirstConnection(), SecondConnection()])
+
+    def fake_connect(*args, **kwargs):
+        connection_calls.append(1)
+        return next(connections)
+
+    monkeypatch.setattr(
+        watchers_module, "ConnectionClosedError", FakeConnectionClosedError
+    )
+    monkeypatch.setattr(watchers_module, "ConnectionClosedOK", FakeConnectionClosedOK)
+    monkeypatch.setattr(watchers_module, "connect", fake_connect)
+    monkeypatch.setattr(watchers_module.time, "sleep", lambda _: None)
+
+    watcher = watchers_module.WebSocketWatcher(
+        ws_url_for_task=lambda task_id: f"ws://example.invalid/{task_id}",
+        poll_fallback=None,
+        fallback_to_poll=False,
+        connect_timeout=1.0,
+        default_timeout=10.0,
+    )
+
+    updates = list(watcher.iter_updates(task_id="task-1"))
+
+    assert len(connection_calls) == 2
+    assert [u.task_status for u in updates] == ["pending", "pending", "success"]
+
+
+def test_websocket_watcher_raises_after_max_reconnect_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeConnectionClosedError(Exception):
+        pass
+
+    class FakeConnectionClosedOK(Exception):
+        pass
+
+    connection_calls: list[int] = []
+
+    class DroppingConnection:
+        def __enter__(self) -> "DroppingConnection":
+            return self
+
+        def recv(self, timeout: float | None = None) -> str:
+            raise FakeConnectionClosedError("connection reset")
+
+        def send(self, message: str) -> None:
+            pass
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    def fake_connect(*args, **kwargs):
+        connection_calls.append(1)
+        return DroppingConnection()
+
+    monkeypatch.setattr(
+        watchers_module, "ConnectionClosedError", FakeConnectionClosedError
+    )
+    monkeypatch.setattr(watchers_module, "ConnectionClosedOK", FakeConnectionClosedOK)
+    monkeypatch.setattr(watchers_module, "connect", fake_connect)
+    monkeypatch.setattr(watchers_module.time, "sleep", lambda _: None)
+
+    watcher = watchers_module.WebSocketWatcher(
+        ws_url_for_task=lambda task_id: f"ws://example.invalid/{task_id}",
+        poll_fallback=None,
+        fallback_to_poll=False,
+        connect_timeout=1.0,
+        default_timeout=10.0,
+    )
+
+    with pytest.raises(watchers_module.ServiceUnavailableError):
+        list(watcher.iter_updates(task_id="task-1"))
+
+    assert len(connection_calls) == watchers_module.WS_MAX_RECONNECT_ATTEMPTS + 1
+
+
 @pytest.mark.anyio
 async def test_async_wait_for_terminal_enforces_minimum_client_cadence(
     monkeypatch: pytest.MonkeyPatch,
@@ -405,16 +563,17 @@ def test_convert_all_uses_async_pipeline_and_preserves_order(tmp_path) -> None:
             max_in_flight,
             ordered,
         ):
+            items = list(item_list)
             calls.append(
                 {
-                    "count": len(item_list),
+                    "count": len(items),
                     "max_in_flight": max_in_flight,
                     "ordered": ordered,
-                    "source_headers": [item.source_headers for item in item_list],
-                    "request_headers": [item.headers for item in item_list],
+                    "source_headers": [item.source_headers for item in items],
+                    "request_headers": [item.headers for item in items],
                 }
             )
-            for item in item_list:
+            for item in items:
                 yield item, _convert_payload(Path(item.source).name)
 
         client._submit_and_retrieve_many_async = MethodType(
@@ -452,6 +611,167 @@ def test_convert_all_uses_async_pipeline_and_preserves_order(tmp_path) -> None:
     ]
     assert [result.input.file.name for result in results] == ["a.pdf", "b.pdf", "c.pdf"]
     assert all(result.status == ConversionStatus.SUCCESS for result in results)
+
+
+def test_convert_all_returns_iterator_and_yields_before_batch_completion(
+    tmp_path: Path,
+) -> None:
+    release_first = threading.Event()
+    release_third = threading.Event()
+
+    with DoclingServiceClient(url=TEST_BASE_URL) as client:
+
+        async def fake_submit_and_retrieve_many_async(
+            self,
+            item_list,
+            max_in_flight,
+            ordered,
+        ):
+            items = list(item_list)
+            assert max_in_flight == 2
+            assert ordered is True
+
+            await asyncio.to_thread(release_first.wait)
+            yield items[0], _convert_payload(Path(items[0].source).name)
+            yield items[1], _convert_payload(Path(items[1].source).name)
+
+            await asyncio.to_thread(release_third.wait)
+            yield items[2], _convert_payload(Path(items[2].source).name)
+
+        client._submit_and_retrieve_many_async = MethodType(
+            fake_submit_and_retrieve_many_async, client
+        )
+
+        p1 = tmp_path / "a.pdf"
+        p2 = tmp_path / "b.pdf"
+        p3 = tmp_path / "c.pdf"
+        p1.write_bytes(b"%PDF-1.4\n")
+        p2.write_bytes(b"%PDF-1.4\n")
+        p3.write_bytes(b"%PDF-1.4\n")
+
+        iterator_queue: queue.Queue[object] = queue.Queue(maxsize=1)
+
+        def build_iterator() -> None:
+            try:
+                iterator_queue.put(
+                    client.convert_all(
+                        [p1, p2, p3],
+                        options=ConvertDocumentsRequestOptions(),
+                        max_concurrency=2,
+                    )
+                )
+            except BaseException as exc:
+                iterator_queue.put(exc)
+
+        build_thread = threading.Thread(target=build_iterator)
+        build_thread.start()
+
+        iterator_or_exc = iterator_queue.get(timeout=0.2)
+        build_thread.join(timeout=0.2)
+
+        if isinstance(iterator_or_exc, BaseException):
+            raise iterator_or_exc
+
+        assert build_thread.is_alive() is False
+        iterator = iterator_or_exc
+
+        first_result_queue: queue.Queue[object] = queue.Queue(maxsize=1)
+
+        def consume_first_result() -> None:
+            try:
+                first_result_queue.put(next(iterator))
+            except BaseException as exc:
+                first_result_queue.put(exc)
+
+        first_thread = threading.Thread(target=consume_first_result)
+        first_thread.start()
+        time.sleep(0.05)
+        assert first_result_queue.empty()
+
+        release_first.set()
+        first_result_or_exc = first_result_queue.get(timeout=0.2)
+        first_thread.join(timeout=0.2)
+
+        if isinstance(first_result_or_exc, BaseException):
+            raise first_result_or_exc
+
+        first_result = first_result_or_exc
+        assert first_thread.is_alive() is False
+        assert first_result.input.file.name == "a.pdf"
+        assert next(iterator).input.file.name == "b.pdf"
+
+        release_third.set()
+        assert next(iterator).input.file.name == "c.pdf"
+
+        with pytest.raises(StopIteration):
+            next(iterator)
+
+
+def test_convert_all_interleaves_preflight_skips_correctly(tmp_path: Path) -> None:
+    with DoclingServiceClient(url=TEST_BASE_URL) as client:
+        submitted_names: list[str] = []
+
+        async def fake_submit_and_retrieve_many_async(
+            self,
+            item_list,
+            max_in_flight,
+            ordered,
+        ):
+            items = list(item_list)
+            assert max_in_flight == DEFAULT_MAX_CONCURRENCY
+            assert ordered is True
+
+            for item in items:
+                submitted_names.append(Path(item.source).name)
+                yield item, _convert_payload(Path(item.source).name)
+
+        client._submit_and_retrieve_many_async = MethodType(
+            fake_submit_and_retrieve_many_async, client
+        )
+
+        p1 = tmp_path / "a.pdf"
+        p2 = tmp_path / "b.pdf"
+        p3 = tmp_path / "c.pdf"
+        p4 = tmp_path / "d.pdf"
+        p1.write_bytes(b"aa")
+        p2.write_bytes(b"b")
+        p3.write_bytes(b"cc")
+        p4.write_bytes(b"d")
+
+        results = list(client.convert_all([p1, p2, p3, p4], max_file_size=1))
+
+    assert submitted_names == ["b.pdf", "d.pdf"]
+    assert [result.input.file.name for result in results] == [
+        "a.pdf",
+        "b.pdf",
+        "c.pdf",
+        "d.pdf",
+    ]
+    assert [result.status for result in results] == [
+        ConversionStatus.SKIPPED,
+        ConversionStatus.SUCCESS,
+        ConversionStatus.SKIPPED,
+        ConversionStatus.SUCCESS,
+    ]
+    assert "max_file_size" in results[0].errors[0].error_message
+    assert "max_file_size" in results[2].errors[0].error_message
+
+
+@pytest.mark.parametrize("value", [0, -1, MAX_CONCURRENCY_LIMIT + 1])
+def test_convert_all_rejects_invalid_max_concurrency(
+    tmp_path: Path, value: int
+) -> None:
+    source = tmp_path / "a.pdf"
+    source.write_bytes(b"%PDF-1.4\n")
+
+    with DoclingServiceClient(url=TEST_BASE_URL) as client:
+        with pytest.raises(
+            ValueError,
+            match=(
+                f"max_concurrency must be between 1 and {MAX_CONCURRENCY_LIMIT}, got {value}."
+            ),
+        ):
+            list(client.convert_all([source], max_concurrency=value))
 
 
 def test_submit_and_retrieve_many_yields_completion_order_and_ordered_mode(
@@ -761,6 +1081,92 @@ def test_submit_and_retrieve_many_respects_max_in_flight(tmp_path: Path) -> None
     assert state["max_seen"] == 2
 
 
+def test_submit_and_retrieve_many_consumes_iterable_incrementally(
+    tmp_path: Path,
+) -> None:
+    class _DummyAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    generated: list[str] = []
+
+    with DoclingServiceClient(
+        url=TEST_BASE_URL,
+        status_watcher="polling",
+    ) as client:
+
+        def fake_build_async_http_client(self):
+            return _DummyAsyncClient()
+
+        async def fake_submit(
+            self, source, source_headers, options, async_client, request_headers=None
+        ):
+            return _status_response(f"task-{Path(source).name}", "pending")
+
+        async def fake_wait(self, task_id, timeout, async_client):
+            await asyncio.sleep(
+                0
+            )  # yield so the event loop can process completed results
+            return _status_response(task_id, "success")
+
+        async def fake_fetch_payload(self, task_id, last_status, async_client):
+            return _convert_payload(task_id.removeprefix("task-"))
+
+        client._build_async_http_client = MethodType(
+            fake_build_async_http_client, client
+        )
+        client._submit_convert_task_async = MethodType(fake_submit, client)
+        client._wait_for_terminal_status_async = MethodType(fake_wait, client)
+        client._fetch_convert_result_payload_async = MethodType(
+            fake_fetch_payload, client
+        )
+
+        def item_iter():
+            for idx in range(50):
+                path = tmp_path / f"{idx}.pdf"
+                path.write_bytes(b"%PDF-1.4\n")
+                generated.append(path.name)
+                yield ConversionItem(source=path)
+
+        iterator = client.submit_and_retrieve_many(
+            item_iter(),
+            max_in_flight=1,
+        )
+        assert generated == []
+
+        first_item, _ = next(iterator)
+        assert Path(first_item.source).name == "0.pdf"
+        assert len(generated) < 50
+
+        remaining_names = [Path(item.source).name for item, _ in iterator]
+
+    assert remaining_names[-1] == "49.pdf"
+    assert len(generated) == 50
+
+
+@pytest.mark.parametrize("value", [0, -1, MAX_CONCURRENCY_LIMIT + 1])
+def test_submit_and_retrieve_many_rejects_invalid_max_in_flight(
+    tmp_path: Path, value: int
+) -> None:
+    source = tmp_path / "a.pdf"
+    source.write_bytes(b"%PDF-1.4\n")
+
+    with DoclingServiceClient(url=TEST_BASE_URL) as client:
+        with pytest.raises(
+            ValueError,
+            match=(
+                f"max_in_flight must be between 1 and {MAX_CONCURRENCY_LIMIT}, got {value}."
+            ),
+        ):
+            client.submit_and_retrieve_many(
+                [ConversionItem(source=source)],
+                max_in_flight=value,
+            )
+
+
 @pytest.mark.anyio
 async def test_submit_and_retrieve_many_prefers_websocket_wait_at_or_below_threshold() -> (
     None
@@ -864,6 +1270,82 @@ async def test_submit_and_retrieve_many_respects_explicit_polling_watcher_for_wa
 
     assert result.task_status == "success"
     assert seen == [("task-3", 5.0, marker)]
+
+
+@pytest.mark.anyio
+async def test_submit_and_retrieve_many_ordered_mode_yields_before_batch_completion(
+    tmp_path: Path,
+) -> None:
+    class _DummyAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+    release_first = asyncio.Event()
+    release_third = asyncio.Event()
+
+    with DoclingServiceClient(
+        url=TEST_BASE_URL,
+        status_watcher="polling",
+    ) as client:
+
+        def fake_build_async_http_client(self):
+            return _DummyAsyncClient()
+
+        async def fake_submit(
+            self, source, source_headers, options, async_client, request_headers=None
+        ):
+            return _status_response(f"task-{Path(source).name}", "pending")
+
+        async def fake_wait(self, task_id, timeout, async_client):
+            if task_id == "task-a.pdf":
+                await release_first.wait()
+            if task_id == "task-c.pdf":
+                await release_third.wait()
+            return _status_response(task_id, "success")
+
+        async def fake_fetch_payload(self, task_id, last_status, async_client):
+            return _convert_payload(task_id.removeprefix("task-"))
+
+        client._build_async_http_client = MethodType(
+            fake_build_async_http_client, client
+        )
+        client._submit_convert_task_async = MethodType(fake_submit, client)
+        client._wait_for_terminal_status_async = MethodType(fake_wait, client)
+        client._fetch_convert_result_payload_async = MethodType(
+            fake_fetch_payload, client
+        )
+
+        items: list[ConversionItem] = []
+        for name in ["a.pdf", "b.pdf", "c.pdf"]:
+            path = tmp_path / name
+            path.write_bytes(b"%PDF-1.4\n")
+            items.append(ConversionItem(source=path))
+
+        async_iterator = client._submit_and_retrieve_many_async(
+            item_list=items,
+            max_in_flight=2,
+            ordered=True,
+        )
+
+        first_result_task = asyncio.create_task(anext(async_iterator))
+        await asyncio.sleep(0)
+        release_first.set()
+
+        first_item, _ = await asyncio.wait_for(first_result_task, timeout=0.2)
+        second_item, _ = await asyncio.wait_for(anext(async_iterator), timeout=0.2)
+
+        assert Path(first_item.source).name == "a.pdf"
+        assert Path(second_item.source).name == "b.pdf"
+
+        release_third.set()
+        third_item, _ = await asyncio.wait_for(anext(async_iterator), timeout=0.2)
+        assert Path(third_item.source).name == "c.pdf"
+
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.wait_for(anext(async_iterator), timeout=0.2)
 
 
 def test_submit_url_forwards_request_headers() -> None:
@@ -1152,6 +1634,31 @@ def test_500_retries_with_exponential_backoff(
     assert sleep_calls == [1.0, 2.0, 4.0]
 
 
+def test_502_retries_with_exponential_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(client_module.time, "sleep", lambda s: sleep_calls.append(s))
+
+    call_count = 0
+
+    def fake_request(**kw: object) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        if call_count < 4:
+            return httpx.Response(502, json={"detail": "bad gateway"})
+        return httpx.Response(200, json={})
+
+    with DoclingServiceClient(url=TEST_BASE_URL) as client:
+        client._http_client.request = fake_request  # type: ignore[method-assign]
+        response = client._request_with_retry(
+            method="POST", path="/v1/convert/source/async", retries=3
+        )
+
+    assert response.status_code == 200
+    assert sleep_calls == [1.0, 2.0, 4.0]
+
+
 def test_503_after_all_retries_raises_service_unavailable_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1165,6 +1672,77 @@ def test_503_after_all_retries_raises_service_unavailable_error(
             client._request_with_retry(
                 method="POST", path="/v1/convert/source/async", retries=2
             )
+
+
+def test_get_transport_error_retries_with_exponential_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(client_module.time, "sleep", lambda s: sleep_calls.append(s))
+
+    call_count = 0
+
+    def fake_request(**kw: object) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        if call_count < 3:
+            raise httpx.ConnectTimeout("connect timed out")
+        return httpx.Response(200, json={})
+
+    with DoclingServiceClient(url=TEST_BASE_URL) as client:
+        client._http_client.request = fake_request  # type: ignore[method-assign]
+        response = client._request_with_retry(method="GET", path="/v1/result/task-123")
+
+    assert response.status_code == 200
+    assert sleep_calls == [1.0, 2.0]
+
+
+def test_post_transport_error_does_not_retry() -> None:
+    call_count = 0
+
+    def fake_request(**kw: object) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        raise httpx.ConnectTimeout("connect timed out")
+
+    with DoclingServiceClient(url=TEST_BASE_URL) as client:
+        client._http_client.request = fake_request  # type: ignore[method-assign]
+        with pytest.raises(
+            ServiceUnavailableError,
+            match="Service transport request failed",
+        ):
+            client._request_with_retry(
+                method="POST", path="/v1/convert/source/async", retries=3
+            )
+
+    assert call_count == 1
+
+
+def test_get_transport_error_after_all_retries_raises_service_unavailable_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(client_module.time, "sleep", lambda s: sleep_calls.append(s))
+
+    call_count = 0
+
+    def fake_request(**kw: object) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        raise httpx.ConnectTimeout("connect timed out")
+
+    with DoclingServiceClient(url=TEST_BASE_URL) as client:
+        client._http_client.request = fake_request  # type: ignore[method-assign]
+        with pytest.raises(
+            ServiceUnavailableError,
+            match="Service transport request failed after retries",
+        ):
+            client._request_with_retry(
+                method="GET", path="/v1/result/task-123", retries=2
+            )
+
+    assert call_count == 3
+    assert sleep_calls == [1.0, 2.0]
 
 
 @pytest.mark.anyio
@@ -1235,6 +1813,96 @@ async def test_429_with_retry_after_header_retries_async(
 
     assert response.status_code == 200
     assert sleep_calls == [5.0]
+
+
+@pytest.mark.anyio
+async def test_502_retries_with_exponential_backoff_async(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(s: float) -> None:
+        sleep_calls.append(s)
+
+    monkeypatch.setattr(client_module.asyncio, "sleep", fake_sleep)
+
+    call_count = 0
+
+    class FakeAsyncClient:
+        async def request(self, **kw: object) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            if call_count < 4:
+                return httpx.Response(502, json={"detail": "bad gateway"})
+            return httpx.Response(200, json={})
+
+    with DoclingServiceClient(url=TEST_BASE_URL) as client:
+        response = await client._request_with_retry_async(
+            async_client=FakeAsyncClient(),  # type: ignore[arg-type]
+            method="POST",
+            path="/v1/convert/source/async",
+            retries=3,
+        )
+
+    assert response.status_code == 200
+    assert sleep_calls == [1.0, 2.0, 4.0]
+
+
+@pytest.mark.anyio
+async def test_get_transport_error_retries_async(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(s: float) -> None:
+        sleep_calls.append(s)
+
+    monkeypatch.setattr(client_module.asyncio, "sleep", fake_sleep)
+
+    call_count = 0
+
+    class FakeAsyncClient:
+        async def request(self, **kw: object) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                raise httpx.ConnectTimeout("connect timed out")
+            return httpx.Response(200, json={})
+
+    with DoclingServiceClient(url=TEST_BASE_URL) as client:
+        response = await client._request_with_retry_async(
+            async_client=FakeAsyncClient(),  # type: ignore[arg-type]
+            method="GET",
+            path="/v1/result/task-123",
+        )
+
+    assert response.status_code == 200
+    assert sleep_calls == [1.0, 2.0]
+
+
+@pytest.mark.anyio
+async def test_post_transport_error_does_not_retry_async() -> None:
+    call_count = 0
+
+    class FakeAsyncClient:
+        async def request(self, **kw: object) -> httpx.Response:
+            nonlocal call_count
+            call_count += 1
+            raise httpx.ConnectTimeout("connect timed out")
+
+    with DoclingServiceClient(url=TEST_BASE_URL) as client:
+        with pytest.raises(
+            ServiceUnavailableError,
+            match="Service transport request failed",
+        ):
+            await client._request_with_retry_async(
+                async_client=FakeAsyncClient(),  # type: ignore[arg-type]
+                method="POST",
+                path="/v1/convert/source/async",
+                retries=3,
+            )
+
+    assert call_count == 1
 
 
 # --- Path-prefix URL tests ---
